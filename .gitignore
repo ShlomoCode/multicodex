@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Authentication and local account state must never enter the repository.
+auth.json
+.codex/
+.codex-accounts/
