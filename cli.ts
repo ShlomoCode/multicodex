@@ -10,6 +10,20 @@ export class MultiCodexError extends Error {}
 
 type Account = { name: string; home: string; expected_email?: string };
 type Config = { version: 1; accounts: Account[]; active_account?: string };
+type AutoWakeAccountState = {
+  next_reset_at?: number;
+  used_percent?: number;
+  five_hour_next_reset_at?: number;
+  five_hour_used_percent?: number;
+  last_wake_at?: number;
+  last_wake_for_reset_at?: number;
+  last_wake_for_five_hour_reset_at?: number;
+  last_checked_at?: number;
+  last_error?: string;
+};
+type AutoWakeState = { version: 1; accounts: Record<string, AutoWakeAccountState> };
+type WakeWindow = { resets_at: number; used_percent: number };
+type WakeObservation = { email: string | null; weekly: WakeWindow; five_hour: WakeWindow | null };
 type Json = Record<string, any>;
 type OutputFormat = "text" | "json";
 
@@ -25,7 +39,12 @@ const PLAN_NAMES: Record<string, string> = {
   pro: "Pro X20",
   chatgptpro: "Pro X20",
 };
-const HELP = `usage: multicodex [--data-dir PATH] {add,remove,rename,list,use,current,exec,usage,wake} ...
+const AUTO_WAKE_LABEL = "local.multicodex.auto-wake";
+const WEEKLY_WINDOW_MINUTES = 10080;
+const AUTO_WAKE_INTERVAL_SECONDS = 15 * 60;
+const WAKE_MODEL = "gpt-5.6-terra";
+const WAKE_REASONING_EFFORT = "low";
+const HELP = `usage: multicodex [--data-dir PATH] {add,remove,rename,list,use,current,exec,usage,wake,autowake} ...
 
 Use multiple Codex accounts on this computer.
 
@@ -39,10 +58,14 @@ commands:
   exec ACCOUNT [CODEX_ARG...]  run Codex CLI with a specific account
   usage [ACCOUNT]              show usage for one or all accounts
   wake                         send one small request from every account
+  autowake install             check every 15 minutes and wake accounts after quota resets
+  autowake status              show scheduler and per-account state
+  autowake run                 check now and wake only accounts whose reset is due
+  autowake uninstall           remove the background scheduler
 
 options:
   -h, --help                   show this help message and exit
-  --data-dir PATH              account data directory (default: ~/.codex-accounts)
+  --data-dir PATH              account data directory (default: ~/.multicodex-accounts)
   --format FORMAT              output format for list, current, usage, and wake (text or json)
   -J                           shorthand for --format json
 
@@ -52,14 +75,26 @@ Examples:
   multicodex usage
   multicodex exec personal
   multicodex use personal
-  multicodex wake`;
+  multicodex wake
+  multicodex autowake install`;
 
 const expandHome = (value: string) => value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
-export const defaultBase = () => resolve(expandHome(process.env.MULTICODEX_HOME ?? "~/.codex-accounts"));
+const LEGACY_DEFAULT_BASE = () => resolve(expandHome("~/.codex-accounts"));
+export const defaultBase = () => resolve(expandHome(process.env.MULTICODEX_HOME ?? "~/.multicodex-accounts"));
 export const defaultMainHome = () => resolve(expandHome(process.env.CODEX_HOME ?? "~/.codex"));
 const configPath = (base: string) => join(base, "config.json");
 const authPath = (home: string) => join(home, "auth.json");
+const autoWakeStatePath = (base: string) => join(base, "auto-wake-state.json");
+const autoWakePlistPath = () => join(homedir(), "Library", "LaunchAgents", `${AUTO_WAKE_LABEL}.plist`);
 const exists = (path: string) => existsSync(path);
+
+async function migrateLegacyDefaultBase(base: string): Promise<void> {
+  if (process.env.MULTICODEX_HOME || base !== defaultBase()) return;
+  const legacy = LEGACY_DEFAULT_BASE();
+  if (legacy === base || !exists(legacy) || exists(base)) return;
+  await rename(legacy, base);
+  console.error(`multicodex: migrated account data to ${base}`);
+}
 
 export function validateName(name: string): string {
   if (!name || name === "." || name === "..") throw new MultiCodexError("account name cannot be empty");
@@ -102,6 +137,23 @@ export async function saveConfig(base: string, config: Config): Promise<void> {
   await rename(temporary, configPath(base));
 }
 
+async function loadAutoWakeState(base: string): Promise<AutoWakeState> {
+  const path = autoWakeStatePath(base);
+  if (!exists(path)) return { version: 1, accounts: {} };
+  try {
+    const data = JSON.parse(await readFile(path, "utf8"));
+    if (data.version !== 1 || !data.accounts || typeof data.accounts !== "object") throw new Error("invalid state schema");
+    return data as AutoWakeState;
+  } catch (error) { throw new MultiCodexError(`cannot read ${path}: ${error}`); }
+}
+
+async function saveAutoWakeState(base: string, state: AutoWakeState): Promise<void> {
+  await mkdir(base, { recursive: true });
+  const temporary = join(base, `.auto-wake-state.${randomUUID()}.tmp`);
+  await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporary, autoWakeStatePath(base));
+}
+
 function decodeJwt(token: unknown): Json | null {
   if (typeof token !== "string") return null;
   try { return JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")); }
@@ -116,6 +168,51 @@ async function readAuth(home: string): Promise<Json> {
   if (platform() !== "win32" && (info.mode & 0o077)) throw new MultiCodexError(`unsafe permissions on ${path}; expected mode 0600`);
   try { return JSON.parse(await readFile(path, "utf8")); }
   catch { throw new MultiCodexError(`cannot parse authentication file ${path}`); }
+}
+
+async function readSecureJson(path: string): Promise<Json> {
+  let info;
+  try { info = await lstat(path); } catch { throw new MultiCodexError(`file is missing: ${path}`); }
+  if (!info.isFile() || info.isSymbolicLink()) throw new MultiCodexError(`path must be a regular, non-symlink file: ${path}`);
+  if (platform() !== "win32" && (info.mode & 0o077)) throw new MultiCodexError(`unsafe permissions on ${path}; expected mode 0600`);
+  try { return JSON.parse(await readFile(path, "utf8")); }
+  catch { throw new MultiCodexError(`cannot parse JSON file ${path}`); }
+}
+
+async function writeSecureJson(path: string, data: Json): Promise<void> {
+  const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+  await writeFile(temporary, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporary, path);
+}
+
+async function syncCliProxyAuth(account: Account): Promise<"source_to_proxy" | "proxy_to_source" | "unchanged" | "unconfigured"> {
+  const proxyPath = join(homedir(), ".cli-proxy-api", `codex-${account.name}.json`);
+  if (!exists(proxyPath)) return "unconfigured";
+  const sourcePath = authPath(account.home);
+  const source = await readAuth(account.home);
+  const proxy = await readSecureJson(proxyPath);
+  const sourceTokens = source.tokens;
+  if (!sourceTokens || typeof sourceTokens !== "object") throw new MultiCodexError(`tokens are missing from ${sourcePath}`);
+  if (account.expected_email && typeof proxy.email === "string" && proxy.email.toLowerCase() !== account.expected_email.toLowerCase()) {
+    throw new MultiCodexError(`CLIProxyAPI auth ${proxyPath} belongs to ${proxy.email}, expected ${account.expected_email}`);
+  }
+  const tokenKeys = ["access_token", "refresh_token", "id_token", "account_id"];
+  if (tokenKeys.every(key => sourceTokens[key] === proxy[key])) return "unchanged";
+  const sourceTime = Date.parse(source.last_refresh ?? "");
+  const proxyTime = Date.parse(proxy.last_refresh ?? "");
+  if (!Number.isFinite(sourceTime) && !Number.isFinite(proxyTime)) {
+    throw new MultiCodexError(`cannot choose the newest credentials for ${account.name}; last_refresh is missing`);
+  }
+  if (Number.isFinite(sourceTime) && (!Number.isFinite(proxyTime) || sourceTime >= proxyTime)) {
+    for (const key of tokenKeys) if (typeof sourceTokens[key] === "string") proxy[key] = sourceTokens[key];
+    proxy.last_refresh = source.last_refresh;
+    await writeSecureJson(proxyPath, proxy);
+    return "source_to_proxy";
+  }
+  for (const key of tokenKeys) if (typeof proxy[key] === "string") sourceTokens[key] = proxy[key];
+  source.last_refresh = proxy.last_refresh;
+  await writeSecureJson(sourcePath, source);
+  return "proxy_to_source";
 }
 
 export async function authEmail(home: string): Promise<string | null> {
@@ -142,7 +239,7 @@ export async function hasUsableSession(account: Account, readAccount = async (ho
   const client = new AppServer(home);
   try {
     await client.initialize();
-    return await client.request("account/read", { refreshToken: true });
+    return await client.request("account/read", { refreshToken: false });
   } finally { await client.close(); }
 }): Promise<boolean> {
   let result: Json;
@@ -214,6 +311,15 @@ class AppServer {
     return line;
   }
   async request(method: string, params: unknown): Promise<Json> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        this.requestWithoutTimeout(method, params),
+        new Promise<Json>((_, reject) => { timeout = setTimeout(() => reject(new MultiCodexError(`${method} timed out after 30 seconds`)), 30_000); }),
+      ]);
+    } finally { if (timeout) clearTimeout(timeout); }
+  }
+  private async requestWithoutTimeout(method: string, params: unknown): Promise<Json> {
     const id = this.id++;
     (this.process.stdin as FileSink).write(`${JSON.stringify({ id, method, params })}\n`);
     await (this.process.stdin as FileSink).flush();
@@ -228,7 +334,10 @@ class AppServer {
   async initialize(): Promise<void> {
     await this.request("initialize", { clientInfo: { name: "multicodex", title: "MultiCodex", version: "2" }, capabilities: { experimentalApi: true } });
   }
-  async close(): Promise<void> { this.process.kill(); await this.process.exited; }
+  async close(): Promise<void> {
+    this.process.kill();
+    await Promise.race([this.process.exited, new Promise(resolve => setTimeout(resolve, 2_000))]);
+  }
 }
 
 export function parseUsage(accountResult: Json, limits: Json): Json {
@@ -237,7 +346,7 @@ export function parseUsage(accountResult: Json, limits: Json): Json {
   const snapshot = limits.rateLimitsByLimitId?.codex ?? limits.rateLimits;
   if (!snapshot) throw new MultiCodexError("rate-limit bucket 'codex' is unavailable");
   const windows = [snapshot.primary, snapshot.secondary].filter(Boolean);
-  const weekly = windows.find((window: Json) => window.windowDurationMins === 10080) ?? (account.planType === "plus" ? snapshot.secondary : snapshot.primary);
+  const weekly = windows.find((window: Json) => window.windowDurationMins === WEEKLY_WINDOW_MINUTES) ?? (account.planType === "plus" ? snapshot.secondary : snapshot.primary);
   if (typeof weekly?.usedPercent !== "number") throw new MultiCodexError("weekly usage window is unavailable");
   const five = account.planType === "plus" ? windows.find((window: Json) => window.windowDurationMins === 300) : null;
   const bankedResets = availableBankedResets(limits.rateLimitResetCredits);
@@ -308,10 +417,11 @@ async function readSubscription(home: string): Promise<Json | null> {
 }
 
 async function queryAccount(account: Account): Promise<Json> {
+  await syncCliProxyAuth(account);
   const client = new AppServer(account.home);
   try {
     await client.initialize();
-    const identity = await client.request("account/read", { refreshToken: true });
+    const identity = await client.request("account/read", { refreshToken: false });
     const limits = await client.request("account/rateLimits/read", null);
     const tac = await readTac(client);
     const usage = parseUsage(identity, limits);
@@ -321,7 +431,34 @@ async function queryAccount(account: Account): Promise<Json> {
     let subscription = null, subscription_error = null;
     try { subscription = await readSubscription(account.home); } catch (error) { subscription_error = String(error instanceof Error ? error.message : error); }
     return { ...usage, name: account.name, capacity, tier: usage.plan_type, tac_level: tac, subscription, subscription_error };
-  } finally { await client.close(); }
+  } finally { await client.close(); await syncCliProxyAuth(account); }
+}
+
+function wakeWindow(limit: Json, label: string): WakeWindow {
+  const resetsAt = limit?.resets_at;
+  const remainingPercent = limit?.remaining_percent;
+  if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt)) throw new MultiCodexError(`${label} reset time is unavailable`);
+  if (typeof remainingPercent !== "number" || !Number.isFinite(remainingPercent)) throw new MultiCodexError(`${label} usage is unavailable`);
+  return { resets_at: resetsAt, used_percent: 100 - remainingPercent };
+}
+
+async function queryWakeWindows(account: Account): Promise<WakeObservation> {
+  await syncCliProxyAuth(account);
+  const client = new AppServer(account.home);
+  try {
+    await client.initialize();
+    const identity = await client.request("account/read", { refreshToken: false });
+    const limits = await client.request("account/rateLimits/read", null);
+    const usage = parseUsage(identity, limits);
+    if (account.expected_email && usage.email?.toLowerCase() !== account.expected_email.toLowerCase()) {
+      throw new MultiCodexError(`logged in as ${usage.email}, expected ${account.expected_email}`);
+    }
+    return {
+      email: usage.email ?? null,
+      weekly: wakeWindow(usage.limits.weekly, "weekly"),
+      five_hour: usage.limits.five_hour ? wakeWindow(usage.limits.five_hour, "5-hour") : null,
+    };
+  } finally { await client.close(); await syncCliProxyAuth(account); }
 }
 
 const number = (value: number) => Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
@@ -433,7 +570,7 @@ async function linkEntry(source: string, destination: string): Promise<void> {
 }
 
 async function execAccount(base: string, args: string[]): Promise<number> {
-  const config = await loadConfig(base); const account = findAccount(config, args.shift() ?? ""); await verifyIdentity(account);
+  const config = await loadConfig(base); const account = findAccount(config, args.shift() ?? ""); await syncCliProxyAuth(account); await verifyIdentity(account);
   const main = defaultMainHome(); const overlay = await mkdtemp(join(dirname(main), ".multicodex-exec-"));
   const original = await readFile(authPath(account.home));
   try {
@@ -442,6 +579,7 @@ async function execAccount(base: string, args: string[]): Promise<number> {
     const code = (await run([findExecutable("codex"), ...args.filter((value, index) => !(index === 0 && value === "--"))], { env: { ...Bun.env, CODEX_HOME: overlay } })).code;
     const refreshed = await readFile(authPath(overlay)); const current = await readFile(authPath(account.home));
     if (!refreshed.equals(original) && current.equals(original)) await copyAuth(overlay, account.home);
+    await syncCliProxyAuth(account);
     return code;
   } finally { await rm(overlay, { recursive: true, force: true }); }
 }
@@ -553,14 +691,28 @@ async function usage(base: string, args: string[], format: OutputFormat): Promis
 }
 
 async function wakeOne(account: Account): Promise<{ name: string; code: number; detail: string }> {
+  await syncCliProxyAuth(account);
   const challenge = randomBytes(32).toString("hex"); const directory = await mkdtemp(join(tmpdir(), "multicodex-wake-")); const output = join(directory, "last-message.txt");
   try {
     const prompt = `Reply with exactly the following challenge string and nothing else. Do not use Markdown and do not call tools:\n${challenge}`;
-    const result = await run([findExecutable("codex"), "exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "--output-last-message", output, prompt], { env: { ...Bun.env, CODEX_HOME: account.home }, stdout: "pipe", stderr: "pipe" });
+    const result = await run([findExecutable("codex"), ...wakeCodexArgs(output, prompt)], { env: { ...Bun.env, CODEX_HOME: account.home }, stdout: "pipe", stderr: "pipe" });
     if (result.code) return { name: account.name, code: result.code, detail: result.stderr.trim() || "Codex request failed" };
     const response = (await readFile(output, "utf8")).trimEnd(); const matches = response.length === challenge.length && timingSafeEqual(Buffer.from(response), Buffer.from(challenge));
     return { name: account.name, code: matches ? 0 : 1, detail: matches ? "challenge verified" : "Codex response did not match the random challenge" };
-  } finally { await rm(directory, { recursive: true, force: true }); }
+  } finally { await rm(directory, { recursive: true, force: true }); await syncCliProxyAuth(account); }
+}
+
+export function wakeCodexArgs(output: string, prompt: string): string[] {
+  return [
+    "exec",
+    "--model", WAKE_MODEL,
+    "--config", `model_reasoning_effort=${JSON.stringify(WAKE_REASONING_EFFORT)}`,
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--sandbox", "read-only",
+    "--output-last-message", output,
+    prompt,
+  ];
 }
 
 async function wake(base: string, format: OutputFormat): Promise<number> {
@@ -581,6 +733,241 @@ async function wake(base: string, format: OutputFormat): Promise<number> {
     usages.forEach((result, index) => { if (result.status === "rejected") console.log(`${accounts[index].name}: unavailable`); else { console.log(`${accounts[index].name}:`); if (result.value.limits.five_hour) printReset("5-hour", result.value.limits.five_hour.resets_at); printReset("Weekly", result.value.limits.weekly.resets_at); } });
   }
   return results.some(result => result.code) || usages.some(result => result.status === "rejected") ? 1 : 0;
+}
+
+function xmlEscape(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
+}
+
+function launchDomain(): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid === null) throw new MultiCodexError("autowake requires a user launchd session");
+  return `gui/${uid}`;
+}
+
+export function stableAutoWakeExecutable(invoked: string, pathExecutable: string): string {
+  return invoked.includes("/Cellar/multicodex/") ? pathExecutable : invoked;
+}
+
+function autoWakePlist(base: string): string {
+  const invoked = resolve(process.argv[1]);
+  const executable = invoked.includes("/Cellar/multicodex/")
+    ? stableAutoWakeExecutable(invoked, findExecutable("multicodex"))
+    : invoked;
+  const bun = findExecutable("bun");
+  const values = [bun, executable, "--data-dir", base, "--format", "json", "autowake", "run"];
+  const argumentsXml = values.map(value => `      <string>${xmlEscape(value)}</string>`).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${AUTO_WAKE_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+${argumentsXml}
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>${AUTO_WAKE_INTERVAL_SECONDS}</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+  </dict>
+</plist>
+`;
+}
+
+async function launchctl(args: string[]): Promise<{ code: number; detail: string }> {
+  const result = await run(["/bin/launchctl", ...args], { stdout: "pipe", stderr: "pipe" });
+  return { code: result.code, detail: result.stderr.trim() || result.stdout.trim() };
+}
+
+async function installAutoWake(base: string, format: OutputFormat): Promise<number> {
+  if (platform() !== "darwin") throw new MultiCodexError("background autowake installation is currently supported only on macOS; run 'autowake run' from your scheduler on other platforms");
+  await loadConfig(base);
+  const path = autoWakePlistPath();
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  await writeFile(temporary, autoWakePlist(base), { mode: 0o600 });
+  await rename(temporary, path);
+  const domain = launchDomain();
+  await launchctl(["bootout", domain, path]);
+  const loaded = await launchctl(["bootstrap", domain, path]);
+  if (loaded.code) throw new MultiCodexError(`cannot load auto-wake LaunchAgent: ${loaded.detail || `exit code ${loaded.code}`}`);
+  const result = { installed: true, label: AUTO_WAKE_LABEL, interval_seconds: AUTO_WAKE_INTERVAL_SECONDS, plist: path, state: autoWakeStatePath(base) };
+  if (format === "json") console.log(JSON.stringify(result, null, 2));
+  else console.log(`Auto-wake installed.\nChecks: every ${AUTO_WAKE_INTERVAL_SECONDS / 60} minutes and after login\nLaunchAgent: ${path}\nState: ${autoWakeStatePath(base)}`);
+  return 0;
+}
+
+async function uninstallAutoWake(base: string, format: OutputFormat): Promise<number> {
+  if (platform() !== "darwin") throw new MultiCodexError("background auto-wake installation is currently supported only on macOS");
+  const path = autoWakePlistPath();
+  if (exists(path)) {
+    await launchctl(["bootout", launchDomain(), path]);
+    await rm(path, { force: true });
+  }
+  const result = { installed: false, label: AUTO_WAKE_LABEL, state_preserved: exists(autoWakeStatePath(base)) };
+  if (format === "json") console.log(JSON.stringify(result, null, 2));
+  else console.log(`Auto-wake uninstalled.${result.state_preserved ? ` State preserved at ${autoWakeStatePath(base)}.` : ""}`);
+  return 0;
+}
+
+async function autoWakeStatus(base: string, format: OutputFormat): Promise<number> {
+  if (platform() !== "darwin") throw new MultiCodexError("background auto-wake status is currently supported only on macOS");
+  const path = autoWakePlistPath();
+  const loaded = exists(path) && (await launchctl(["print", `${launchDomain()}/${AUTO_WAKE_LABEL}`])).code === 0;
+  const state = await loadAutoWakeState(base);
+  const result = { installed: exists(path), loaded, interval_seconds: AUTO_WAKE_INTERVAL_SECONDS, plist: path, state };
+  if (format === "json") console.log(JSON.stringify(result, null, 2));
+  else {
+    console.log(`Auto-wake: ${loaded ? "running" : exists(path) ? "installed but not loaded" : "not installed"}`);
+    for (const [name, account] of Object.entries(state.accounts)) {
+      const resets = [
+        account.next_reset_at ? `weekly ${timeUntil(account.next_reset_at)}; ${formatDate(account.next_reset_at)}` : null,
+        account.five_hour_next_reset_at ? `5-hour ${timeUntil(account.five_hour_next_reset_at)}; ${formatDate(account.five_hour_next_reset_at)}` : null,
+      ].filter(Boolean).join(", ");
+      const detail = account.last_error ? `error: ${account.last_error}` : resets || "reset not observed yet";
+      console.log(`  ${name}: ${detail}`);
+    }
+  }
+  return loaded || !exists(path) ? 0 : 1;
+}
+
+export function autoWakeDecision(previous: AutoWakeAccountState, observed: { resets_at: number; used_percent: number }, now: number): { due: boolean; unexpected_reset: boolean; wake_for_reset: number; tracked_reset: number } {
+  const trackedReset = typeof previous.next_reset_at === "number" ? previous.next_reset_at : observed.resets_at;
+  const scheduledReset = trackedReset <= now;
+  const resetMovedForward = typeof previous.next_reset_at === "number" && observed.resets_at > previous.next_reset_at + 5 * 60;
+  const usageDroppedToZero = typeof previous.used_percent === "number" && previous.used_percent > 0 && observed.used_percent === 0;
+  const unexpectedReset = !scheduledReset && observed.used_percent === 0 && (resetMovedForward || usageDroppedToZero);
+  const wakeForReset = unexpectedReset ? observed.resets_at : trackedReset;
+  return {
+    due: observed.used_percent === 0 && (scheduledReset || unexpectedReset) && previous.last_wake_for_reset_at !== wakeForReset,
+    unexpected_reset: unexpectedReset,
+    wake_for_reset: wakeForReset,
+    tracked_reset: trackedReset,
+  };
+}
+
+function fiveHourState(previous: AutoWakeAccountState): AutoWakeAccountState {
+  return {
+    next_reset_at: previous.five_hour_next_reset_at,
+    used_percent: previous.five_hour_used_percent,
+    last_wake_for_reset_at: previous.last_wake_for_five_hour_reset_at,
+  };
+}
+
+export function autoWakeDecisions(previous: AutoWakeAccountState, observed: WakeObservation, now: number) {
+  const weekly = autoWakeDecision(previous, observed.weekly, now);
+  let fiveHour = observed.five_hour ? autoWakeDecision(fiveHourState(previous), observed.five_hour, now) : null;
+  if (fiveHour?.due && observed.weekly.used_percent >= 100) fiveHour = { ...fiveHour, due: false };
+  return { weekly, five_hour: fiveHour };
+}
+
+function confirmedAutoWakeDecisions(previous: AutoWakeAccountState, first: WakeObservation, second: WakeObservation, now: number) {
+  const decisions = autoWakeDecisions(previous, second, now);
+  return {
+    weekly: {
+      ...decisions.weekly,
+      due: first.weekly.used_percent === 0 && second.weekly.used_percent === 0 && decisions.weekly.due,
+    },
+    five_hour: decisions.five_hour ? {
+      ...decisions.five_hour,
+      due: first.five_hour?.used_percent === 0 && second.five_hour?.used_percent === 0 && decisions.five_hour.due,
+    } : null,
+  };
+}
+
+async function runAutoWake(base: string, format: OutputFormat, now = Math.floor(Date.now() / 1000)): Promise<number> {
+  const config = await loadConfig(base);
+  if (!config.accounts.length) throw new MultiCodexError("no accounts configured; use 'add' first");
+  const state = await loadAutoWakeState(base);
+  const results: Json[] = [];
+  for (const account of config.accounts) {
+    const previous = state.accounts[account.name] ?? {};
+    try {
+      const first = await queryWakeWindows(account);
+      let observed = first;
+      let decisions = autoWakeDecisions(previous, observed, now);
+      if (decisions.weekly.due || decisions.five_hour?.due) {
+        observed = await queryWakeWindows(account);
+        decisions = confirmedAutoWakeDecisions(previous, first, observed, now);
+      }
+      const weeklyDue = decisions.weekly.due;
+      const fiveHourDue = decisions.five_hour?.due === true;
+      if (!weeklyDue && !fiveHourDue) {
+        state.accounts[account.name] = {
+          ...previous,
+          next_reset_at: observed.weekly.resets_at,
+          used_percent: observed.weekly.used_percent,
+          five_hour_next_reset_at: observed.five_hour?.resets_at,
+          five_hour_used_percent: observed.five_hour?.used_percent,
+          last_checked_at: now,
+          last_error: undefined,
+        };
+        const weeklyActive = decisions.weekly.tracked_reset <= now && observed.weekly.used_percent > 0;
+        const fiveHourActive = decisions.five_hour && decisions.five_hour.tracked_reset <= now && (observed.five_hour?.used_percent ?? 0) > 0;
+        const action = weeklyActive || fiveHourActive ? "already_active" : "waiting";
+        results.push({ name: account.name, action, weekly: observed.weekly, five_hour: observed.five_hour });
+        await saveAutoWakeState(base, state);
+        continue;
+      }
+      const wakeResult = await wakeOne(account);
+      if (wakeResult.code) throw new MultiCodexError(wakeResult.detail);
+      let refreshed = observed;
+      let refreshError: string | undefined;
+      try { refreshed = await queryWakeWindows(account); }
+      catch (error) { refreshError = error instanceof Error ? error.message : String(error); }
+      state.accounts[account.name] = {
+        ...previous,
+        next_reset_at: refreshed.weekly.resets_at,
+        used_percent: refreshed.weekly.used_percent,
+        five_hour_next_reset_at: refreshed.five_hour?.resets_at,
+        five_hour_used_percent: refreshed.five_hour?.used_percent,
+        last_wake_at: now,
+        last_wake_for_reset_at: weeklyDue ? decisions.weekly.wake_for_reset : previous.last_wake_for_reset_at,
+        last_wake_for_five_hour_reset_at: fiveHourDue ? decisions.five_hour!.wake_for_reset : previous.last_wake_for_five_hour_reset_at,
+        last_checked_at: now,
+        last_error: refreshError,
+      };
+      const wokenWindows = [
+        weeklyDue ? { window: "weekly", reason: decisions.weekly.unexpected_reset ? "unexpected_reset" : "scheduled_reset", reset_at: decisions.weekly.wake_for_reset } : null,
+        fiveHourDue ? { window: "five_hour", reason: decisions.five_hour!.unexpected_reset ? "unexpected_reset" : "scheduled_reset", reset_at: decisions.five_hour!.wake_for_reset } : null,
+      ].filter(Boolean);
+      results.push({ name: account.name, action: "woken", windows: wokenWindows, weekly: refreshed.weekly, five_hour: refreshed.five_hour, warning: refreshError ?? null });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      state.accounts[account.name] = { ...previous, last_checked_at: now, last_error: message };
+      results.push({ name: account.name, action: "error", error: message });
+    }
+    await saveAutoWakeState(base, state);
+  }
+  await saveAutoWakeState(base, state);
+  const output = { checked_at: now, accounts: results };
+  if (format === "json") console.log(JSON.stringify(output, null, 2));
+  else for (const result of results) {
+    const resets = [
+      result.weekly?.resets_at ? `weekly ${timeUntil(result.weekly.resets_at)}` : null,
+      result.five_hour?.resets_at ? `5-hour ${timeUntil(result.five_hour.resets_at)}` : null,
+    ].filter(Boolean).join(", ");
+    console.log(`${result.name}: ${result.action}${result.error ? `: ${result.error}` : resets ? `; ${resets}` : ""}`);
+  }
+  return results.some(result => result.action === "error") ? 1 : 0;
+}
+
+async function autoWake(base: string, args: string[], format: OutputFormat): Promise<number> {
+  const action = args[0] ?? "status";
+  if (args.length > 1) throw new MultiCodexError(`unexpected autowake argument: ${args[1]}`);
+  switch (action) {
+    case "install": return installAutoWake(base, format);
+    case "uninstall": return uninstallAutoWake(base, format);
+    case "status": return autoWakeStatus(base, format);
+    case "run": return runAutoWake(base, format);
+    default: throw new MultiCodexError(`unknown autowake action: ${action}`);
+  }
 }
 
 export function parse(argv: string[]): { base: string; format: OutputFormat; command?: string; args: string[] } {
@@ -629,7 +1016,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   let format: OutputFormat = requestsJson(argv) ? "json" : "text";
   try {
     const parsed = parse(argv); const { base, command, args } = parsed; format = parsed.format;
-    if (format === "json" && command && !["list", "current", "usage", "wake"].includes(command)) throw new MultiCodexError(`JSON output is not supported for the '${command}' command`);
+    if (command !== undefined && command !== "help") await migrateLegacyDefaultBase(base);
+    if (format === "json" && command && !["list", "current", "usage", "wake", "autowake"].includes(command)) throw new MultiCodexError(`JSON output is not supported for the '${command}' command`);
     switch (command) {
       case undefined: case "help": console.log(HELP); return 0;
       case "add": return await add(base, args);
@@ -641,6 +1029,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       case "exec": return await execAccount(base, args);
       case "usage": return await usage(base, args, format);
       case "wake": return await wake(base, format);
+      case "autowake": return await autoWake(base, args, format);
       default: throw new MultiCodexError(`unknown command: ${command}`);
     }
   } catch (error) {

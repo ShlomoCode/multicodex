@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { authEmail, automaticName, billingOutcome, buildUsageReport, defaultBase, formatDate, hasUsableSession, loadConfig, main, parse, parseUsage, saveConfig, subscriptionSummary, timeUntil, validateEmail, validateName } from "./cli";
+import { authEmail, automaticName, autoWakeDecision, autoWakeDecisions, billingOutcome, buildUsageReport, defaultBase, formatDate, hasUsableSession, loadConfig, main, parse, parseUsage, saveConfig, stableAutoWakeExecutable, subscriptionSummary, timeUntil, validateEmail, validateName, wakeCodexArgs } from "./cli";
 
 const temporaryDirectories: string[] = [];
 
@@ -158,7 +158,7 @@ describe("configuration and commands", () => {
   test("given_no_environment_override_when_default_base_is_read_then_the_home_location_is_used", () => {
     const previous = process.env.MULTICODEX_HOME;
     delete process.env.MULTICODEX_HOME;
-    try { expect(defaultBase()).toEndWith(".codex-accounts"); }
+    try { expect(defaultBase()).toEndWith(".multicodex-accounts"); }
     finally { if (previous === undefined) delete process.env.MULTICODEX_HOME; else process.env.MULTICODEX_HOME = previous; }
   });
 
@@ -245,7 +245,72 @@ describe("configuration and commands", () => {
   test("given_help_when_main_runs_then_all_commands_are_shown", async () => {
     const result = await capture(() => main(["--help"]));
     expect(result.code).toBe(0);
-    expect(result.output).toContain("{add,remove,rename,list,use,current,exec,usage,wake}");
+    expect(result.output).toContain("{add,remove,rename,list,use,current,exec,usage,wake,autowake}");
+  });
+});
+
+describe("automatic wake scheduling", () => {
+  test("given_a_completed_scheduled_reset_with_zero_usage_when_checked_then_wake_is_due", () => {
+    const decision = autoWakeDecision({ next_reset_at: 900, used_percent: 80 }, { resets_at: 700_000, used_percent: 0 }, 1_000);
+    expect(decision.due).toBeTrue();
+    expect(decision.unexpected_reset).toBeFalse();
+  });
+
+  test("given_nonzero_usage_when_a_reset_is_due_then_wake_is_suppressed", () => {
+    const decision = autoWakeDecision({ next_reset_at: 900, used_percent: 80 }, { resets_at: 700_000, used_percent: 0.1 }, 1_000);
+    expect(decision.due).toBeFalse();
+  });
+
+  test("given_an_early_reset_to_zero_when_checked_then_it_is_detected", () => {
+    const decision = autoWakeDecision({ next_reset_at: 2_000, used_percent: 40 }, { resets_at: 700_000, used_percent: 0 }, 1_000);
+    expect(decision.due).toBeTrue();
+    expect(decision.unexpected_reset).toBeTrue();
+    expect(decision.wake_for_reset).toBe(700_000);
+  });
+
+  test("given_an_already_woken_window_when_checked_then_duplicate_wake_is_suppressed", () => {
+    const decision = autoWakeDecision({ next_reset_at: 2_000, used_percent: 40, last_wake_for_reset_at: 700_000 }, { resets_at: 700_000, used_percent: 0 }, 1_000);
+    expect(decision.due).toBeFalse();
+  });
+
+  test("given_a_plus_5_hour_reset_with_weekly_capacity_when_checked_then_wake_is_due", () => {
+    const decisions = autoWakeDecisions(
+      { next_reset_at: 2_000, used_percent: 20, five_hour_next_reset_at: 900, five_hour_used_percent: 80 },
+      { email: null, weekly: { resets_at: 2_000, used_percent: 20 }, five_hour: { resets_at: 20_000, used_percent: 0 } },
+      1_000,
+    );
+    expect(decisions.weekly.due).toBeFalse();
+    expect(decisions.five_hour?.due).toBeTrue();
+  });
+
+  test("given_a_5_hour_reset_with_exhausted_weekly_quota_when_checked_then_wake_is_suppressed", () => {
+    const decisions = autoWakeDecisions(
+      { next_reset_at: 2_000, used_percent: 100, five_hour_next_reset_at: 900, five_hour_used_percent: 80 },
+      { email: null, weekly: { resets_at: 2_000, used_percent: 100 }, five_hour: { resets_at: 20_000, used_percent: 0 } },
+      1_000,
+    );
+    expect(decisions.five_hour?.due).toBeFalse();
+  });
+
+  test("given_an_account_without_a_5_hour_window_when_checked_then_only_weekly_is_tracked", () => {
+    const decisions = autoWakeDecisions(
+      { next_reset_at: 2_000, used_percent: 20 },
+      { email: null, weekly: { resets_at: 2_000, used_percent: 20 }, five_hour: null },
+      1_000,
+    );
+    expect(decisions.five_hour).toBeNull();
+  });
+
+  test("given_a_wake_request_when_arguments_are_built_then_terra_low_is_forced", () => {
+    const args = wakeCodexArgs("/tmp/result", "challenge");
+    expect(args.slice(1, 5)).toEqual(["--model", "gpt-5.6-terra", "--config", 'model_reasoning_effort="low"']);
+  });
+
+  test("given_a_homebrew_cellar_executable_when_the_scheduler_is_built_then_the_stable_link_is_used", () => {
+    expect(stableAutoWakeExecutable(
+      "/opt/homebrew/Cellar/multicodex/0.1.0/bin/multicodex",
+      "/opt/homebrew/bin/multicodex",
+    )).toBe("/opt/homebrew/bin/multicodex");
   });
 });
 
