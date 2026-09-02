@@ -15,13 +15,12 @@ Billing lookup uses the built-in system WebKit on macOS and an installed Chrome,
 ## Install
 
 ```sh
-brew tap ShlomoCode/tap
-brew install multicodex
+brew install ShlomoCode/multicodex/multicodex
 ```
 
-Homebrew installs Bun from `oven-sh/bun`. Codex CLI remains a separate runtime
-requirement. On Windows, download `cli.ts` from the matching GitHub release and
-run it with Bun.
+Homebrew adds the tap automatically and installs Bun from `oven-sh/bun`. Codex
+CLI remains a separate runtime requirement. On Windows, download `cli.ts` from
+the matching GitHub release and run it with Bun.
 
 ## Usage
 
