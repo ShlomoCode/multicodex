@@ -70,11 +70,11 @@ options:
   -J                           shorthand for --format json
 
 Examples:
-  multicodex add you@example.com --name personal
+  multicodex add you@example.com
   multicodex list
   multicodex usage
-  multicodex exec personal
-  multicodex use personal
+  multicodex exec you@example.com
+  multicodex use you@example.com
   multicodex wake
   multicodex autowake install`;
 
