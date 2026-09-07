@@ -498,8 +498,8 @@ async function add(base: string, args: string[]): Promise<number> {
     await saveConfig(base, config);
   }
   if (exists(authPath(account.home)) && await hasUsableSession(account)) {
-    const answer = (prompt("This account is already signed in through its CODEX_HOME. Use that sign-in? [y/N]: ") ?? "").trim().toLowerCase();
-    if (["y", "yes"].includes(answer)) {
+    const answer = (prompt("This account is already signed in through its CODEX_HOME. Use that sign-in? [Y/n]: ") ?? "").trim().toLowerCase();
+    if (!["n", "no"].includes(answer)) {
       console.log("Using the existing sign-in from this account's CODEX_HOME.");
       return 0;
     }
@@ -507,8 +507,8 @@ async function add(base: string, args: string[]): Promise<number> {
   const mainHome = defaultMainHome();
   const mainAccount = { ...account, home: mainHome };
   if (exists(authPath(mainHome)) && (await authEmail(mainHome))?.toLowerCase() === email.toLowerCase() && await hasUsableSession(mainAccount)) {
-    const answer = (prompt("This account is already signed in as the main Codex account. Copy its sign-in? [y/N]: ") ?? "").trim().toLowerCase();
-    if (["y", "yes"].includes(answer)) { await copyAuth(mainHome, account.home); console.log("Sign-in copied from the main Codex account."); return 0; }
+    const answer = (prompt("This account is already signed in as the main Codex account. Copy its sign-in? [Y/n]: ") ?? "").trim().toLowerCase();
+    if (!["n", "no"].includes(answer)) { await copyAuth(mainHome, account.home); console.log("Sign-in copied from the main Codex account."); return 0; }
   }
   return login(account);
 }
