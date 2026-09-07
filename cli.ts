@@ -636,7 +636,7 @@ export function billingOutcome(subscription: Json): string {
   return renewsSamePlan ? `renews as ${target}` : `will switch to ${target}`;
 }
 
-export function buildUsageReport(accounts: Account[], settled: PromiseSettledResult<Json>[]): Json {
+export function buildUsageReport(accounts: Account[], settled: PromiseSettledResult<Json>[], activeAccount?: string): Json {
   const rows = settled.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
   const summary: Json = {
     overall_weekly_remaining_percent: null,
@@ -653,10 +653,11 @@ export function buildUsageReport(accounts: Account[], settled: PromiseSettledRes
   return {
     summary,
     accounts: settled.map((result, index) => result.status === "fulfilled"
-      ? { ...result.value, error: null }
+      ? { ...result.value, active: activeAccount === accounts[index].name, error: null }
       : {
         name: accounts[index].name,
         email: accounts[index].expected_email ?? null,
+        active: activeAccount === accounts[index].name,
         error: result.reason instanceof Error ? result.reason.message : String(result.reason),
       }),
   };
@@ -668,7 +669,7 @@ async function usage(base: string, args: string[], format: OutputFormat): Promis
   if (format === "text") console.log(`Reading usage for ${accounts.length} ${accounts.length === 1 ? "account" : "accounts"}...`);
   const settled = await Promise.allSettled(accounts.map(queryAccount)); const rows = settled.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
   if (format === "json") {
-    console.log(JSON.stringify(buildUsageReport(accounts, settled), null, 2));
+    console.log(JSON.stringify(buildUsageReport(accounts, settled, config.active_account), null, 2));
     return settled.some(result => result.status === "rejected") ? 1 : 0;
   }
   console.log("\nUsage summary");
@@ -677,8 +678,8 @@ async function usage(base: string, args: string[], format: OutputFormat): Promis
   console.log();
   for (let index = 0; index < accounts.length; index++) {
     const result = settled[index], account = accounts[index];
-    if (result.status === "rejected") { console.log(`${account.name} (${account.expected_email ?? "email unknown"}): Usage unavailable\n  Reason: ${result.reason instanceof Error ? result.reason.message : result.reason}\n`); continue; }
-    const row = result.value; console.log(`${row.name} (${row.email ?? "unknown email"}): ${TIERS[row.tier] ?? row.tier}${row.tac_level ? `, ${row.tac_level}` : ""}`);
+    if (result.status === "rejected") { console.log(`${account.name} (${account.expected_email ?? "email unknown"}): Usage unavailable${config.active_account === account.name ? " [current]" : ""}\n  Reason: ${result.reason instanceof Error ? result.reason.message : result.reason}\n`); continue; }
+    const row = result.value; console.log(`${row.name} (${row.email ?? "unknown email"}): ${TIERS[row.tier] ?? row.tier}${row.tac_level ? `, ${row.tac_level}` : ""}${config.active_account === account.name ? " [current]" : ""}`);
     if (row.limits.five_hour) { console.log(`  5-hour usage: ${number(row.limits.five_hour.remaining_percent)}% left`); printReset("5-hour reset", row.limits.five_hour.resets_at); }
     console.log(`  Weekly usage: ${number(row.limits.weekly.remaining_percent)}% left`); printReset("Weekly reset", row.limits.weekly.resets_at);
     if (row.available_banked_resets.length) {

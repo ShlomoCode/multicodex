@@ -333,6 +333,6 @@ describe("JSON usage output", () => {
     expect(report.accounts[0].error).toBeNull();
     expect(report.accounts[0].limits).toEqual({ weekly: { remaining_percent: 50, resets_at: 100 }, five_hour: null });
     expect(report.accounts[0]).not.toHaveProperty("remaining_fraction");
-    expect(report.accounts[1]).toEqual({ name: "two", email: "two@example.com", error: "session expired" });
+    expect(report.accounts[1]).toEqual({ name: "two", email: "two@example.com", active: false, error: "session expired" });
   });
 });
