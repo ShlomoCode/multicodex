@@ -7,6 +7,11 @@ import { basename, dirname, join, resolve } from "node:path";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 
 export class MultiCodexError extends Error {}
+export class AppServerRequestError extends MultiCodexError {
+  constructor(readonly method: string, readonly rpcError: Json) {
+    super(`${method} failed: ${JSON.stringify(rpcError)}`);
+  }
+}
 
 type Account = { name: string; home: string; expected_email?: string };
 type Config = { version: 1; accounts: Account[]; active_account?: string };
@@ -44,6 +49,8 @@ const WEEKLY_WINDOW_MINUTES = 10080;
 const AUTO_WAKE_INTERVAL_SECONDS = 15 * 60;
 const WAKE_MODEL = "gpt-5.6-terra";
 const WAKE_REASONING_EFFORT = "low";
+const WAKE_TIMEOUT_MS = 60_000;
+const WINDOWS_WAKE_RUNNER = 'const child = Bun.spawn(process.argv.slice(1), { env: Bun.env, stdin: "ignore", stdout: "inherit", stderr: "inherit" }); process.exit(await child.exited);';
 const HELP = `usage: multicodex [--data-dir PATH] {add,remove,rename,list,use,current,exec,usage,wake,autowake} ...
 
 Use multiple Codex accounts on this computer.
@@ -227,6 +234,24 @@ export async function authEmail(home: string): Promise<string | null> {
   return null;
 }
 
+function accountIdFromAuth(auth: Json): string | null {
+  const tokenPayloads = ["id_token", "access_token", "idToken", "accessToken"]
+    .map(key => decodeJwt(auth.tokens?.[key]))
+    .filter(Boolean) as Json[];
+  for (const container of [auth, auth.tokens, ...tokenPayloads].filter(Boolean)) {
+    for (const candidate of [container, container["https://api.openai.com/auth"]].filter(Boolean)) {
+      for (const key of ["chatgpt_account_id", "account_id"]) {
+        if (typeof candidate[key] === "string" && candidate[key]) return candidate[key];
+      }
+    }
+  }
+  return null;
+}
+
+async function authAccountId(home: string): Promise<string | null> {
+  return accountIdFromAuth(await readAuth(home));
+}
+
 async function verifyIdentity(account: Account, home = account.home): Promise<string | null> {
   const actual = await authEmail(home);
   if (account.expected_email && actual?.toLowerCase() !== account.expected_email.toLowerCase()) {
@@ -235,11 +260,26 @@ async function verifyIdentity(account: Account, home = account.home): Promise<st
   return actual;
 }
 
+type AppServerClient = { request(method: string, params: unknown): Promise<Json> };
+
+function isRateLimitAuthenticationFailure(error: unknown): boolean {
+  if (!(error instanceof AppServerRequestError) || error.method !== "account/rateLimits/read") return false;
+  const { code, message } = error.rpcError;
+  return code === -32603 && typeof message === "string" && /(?:^|\s)401 Unauthorized(?:;|\s|$)/.test(message);
+}
+
+export async function readAuthenticatedSession(client: AppServerClient): Promise<Json> {
+  const identity = await client.request("account/read", { refreshToken: false });
+  try { await client.request("account/rateLimits/read", null); }
+  catch (error) { if (isRateLimitAuthenticationFailure(error)) throw error; }
+  return identity;
+}
+
 export async function hasUsableSession(account: Account, readAccount = async (home: string): Promise<Json> => {
   const client = new AppServer(home);
   try {
     await client.initialize();
-    return await client.request("account/read", { refreshToken: false });
+    return await readAuthenticatedSession(client);
   } finally { await client.close(); }
 }): Promise<boolean> {
   let result: Json;
@@ -248,7 +288,7 @@ export async function hasUsableSession(account: Account, readAccount = async (ho
   const actual = result.account?.email;
   if (!actual) return false;
   if (account.expected_email && actual.toLowerCase() !== account.expected_email.toLowerCase()) {
-    throw new MultiCodexError(`logged in as ${JSON.stringify(actual)}, expected ${JSON.stringify(account.expected_email)}`);
+    return false;
   }
   return true;
 }
@@ -327,7 +367,7 @@ class AppServer {
       let message: Json;
       try { message = JSON.parse(await this.line()); } catch { continue; }
       if (message.id !== id) continue;
-      if (message.error) throw new MultiCodexError(`${method} failed: ${JSON.stringify(message.error)}`);
+      if (message.error) throw new AppServerRequestError(method, message.error);
       return message.result;
     }
   }
@@ -474,12 +514,23 @@ export const timeUntil = (seconds: unknown, now = Date.now() / 1000) => {
 
 async function login(account: Account): Promise<number> {
   console.log(`Sign in: ${account.name} (${account.expected_email})`);
-  await mkdir(account.home, { recursive: true });
   console.log("Choose how to sign in:\n  1. Browser (recommended)\n  2. Device code (must be enabled in ChatGPT settings)");
   const choice = prompt("Choice [1]: ")?.trim() ?? "";
   if (!["", "1", "2"].includes(choice)) throw new MultiCodexError("enter 1 or 2");
   const command = [findExecutable("codex"), "login", ...(choice === "2" ? ["--device-auth"] : [])];
-  return (await run(command, { env: { ...Bun.env, CODEX_HOME: account.home } })).code;
+  return replaceAuthWithLogin(account, async loginHome => (await run(command, { env: { ...Bun.env, CODEX_HOME: loginHome } })).code);
+}
+
+export async function replaceAuthWithLogin(account: Account, execute: (loginHome: string) => Promise<number>): Promise<number> {
+  await mkdir(dirname(account.home), { recursive: true });
+  const loginHome = await mkdtemp(join(dirname(account.home), `.${basename(account.home)}-login-`));
+  try {
+    const code = await execute(loginHome);
+    if (code !== 0) return code;
+    await verifyIdentity(account, loginHome);
+    await copyAuth(loginHome, account.home);
+    return 0;
+  } finally { await rm(loginHome, { recursive: true, force: true }); }
 }
 
 async function add(base: string, args: string[]): Promise<number> {
@@ -535,7 +586,21 @@ async function removeAccount(base: string, args: string[]): Promise<number> {
 async function useAccount(base: string, args: string[]): Promise<number> {
   const config = await loadConfig(base); const account = findAccount(config, args[0] ?? ""); const main = defaultMainHome();
   console.log(`Switching account: ${account.name}`); await verifyIdentity(account);
-  if (config.active_account && config.active_account !== account.name) { const current = findAccount(config, config.active_account); if (exists(authPath(main))) await copyAuth(main, current.home); }
+  if (config.active_account && config.active_account !== account.name) {
+    const current = findAccount(config, config.active_account);
+    if (exists(authPath(main))) {
+      const actual = await authEmail(main);
+      const savedAuthExists = exists(authPath(current.home));
+      const expected = current.expected_email ?? (savedAuthExists ? await authEmail(current.home) : null);
+      const savedAccountId = savedAuthExists ? await authAccountId(current.home) : null;
+      if (!expected && !savedAccountId) throw new MultiCodexError(`cannot switch accounts safely: saved active account ${JSON.stringify(current.name)} has no email or account ID`);
+      const actualAccountId = await authAccountId(main);
+      const emailMatches = !expected || (actual && actual.toLowerCase() === expected.toLowerCase());
+      const accountIdMatches = !savedAccountId || actualAccountId === savedAccountId;
+      if (emailMatches && accountIdMatches) await copyAuth(main, current.home);
+      else console.error(`multicodex: main Codex identity does not match active account ${JSON.stringify(current.name)}; preserving its saved profile`);
+    }
+  }
   await copyAuth(account.home, main); config.active_account = account.name; await saveConfig(base, config);
   console.log(`Active account: ${account.name}${account.expected_email ? ` (${account.expected_email})` : ""}\nRestart any open Codex app or terminal to use this account.`); return 0;
 }
@@ -694,12 +759,118 @@ async function usage(base: string, args: string[], format: OutputFormat): Promis
   return settled.some(result => result.status === "rejected") ? 1 : 0;
 }
 
-async function wakeOne(account: Account): Promise<{ name: string; code: number; detail: string }> {
+type WakeResult = { name: string; code: number; detail: string };
+type WakeOptions = { command?: string[]; timeoutMs?: number };
+
+function capturedStream(stream: ReadableStream<Uint8Array> | number | undefined) {
+  if (!(stream instanceof ReadableStream)) return { text: Promise.resolve(""), cancel: async () => {} };
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  const text = (async () => {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) return Buffer.concat(chunks).toString("utf8");
+      chunks.push(value);
+    }
+  })();
+  return { text, cancel: () => reader.cancel() };
+}
+
+const activeWakeProcesses = new Set<ReturnType<typeof Bun.spawn>>();
+const wakeSignalHandlers = {
+  SIGINT: () => relayWakeSignal("SIGINT"),
+  SIGTERM: () => relayWakeSignal("SIGTERM"),
+};
+
+function signalWakeProcess(child: ReturnType<typeof Bun.spawn>, signal: NodeJS.Signals): void {
+  if (platform() !== "win32") {
+    try { process.kill(-child.pid, signal); }
+    catch { try { child.kill(signal); } catch {} }
+  } else {
+    try { child.kill(signal); } catch {}
+  }
+}
+
+function relayWakeSignal(signal: "SIGINT" | "SIGTERM"): void {
+  for (const child of activeWakeProcesses) signalWakeProcess(child, "SIGKILL");
+  removeWakeSignalHandlers();
+  process.kill(process.pid, signal);
+}
+
+function addWakeProcess(child: ReturnType<typeof Bun.spawn>): void {
+  if (!activeWakeProcesses.size) {
+    process.on("SIGINT", wakeSignalHandlers.SIGINT);
+    process.on("SIGTERM", wakeSignalHandlers.SIGTERM);
+  }
+  activeWakeProcesses.add(child);
+}
+
+function removeWakeSignalHandlers(): void {
+  process.off("SIGINT", wakeSignalHandlers.SIGINT);
+  process.off("SIGTERM", wakeSignalHandlers.SIGTERM);
+}
+
+function removeWakeProcess(child: ReturnType<typeof Bun.spawn>): void {
+  activeWakeProcesses.delete(child);
+  if (!activeWakeProcesses.size) removeWakeSignalHandlers();
+}
+
+async function stopWakeProcess(child: ReturnType<typeof Bun.spawn>): Promise<void> {
+  signalWakeProcess(child, "SIGKILL");
+  await Promise.race([child.exited.catch(() => {}), Bun.sleep(1_000)]);
+}
+
+export function wakeProcessCommand(command: string[], currentPlatform = platform()): string[] {
+  // The Windows runner owns a kill-on-close job before Codex can spawn descendants.
+  return currentPlatform === "win32"
+    ? [process.execPath, "--no-orphans", "-e", WINDOWS_WAKE_RUNNER, "--", ...command]
+    : command;
+}
+
+async function runWakeRequest(command: string[], account: Account, timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
+  const child = Bun.spawn(wakeProcessCommand(command), {
+    env: { ...Bun.env, CODEX_HOME: account.home },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: platform() !== "win32",
+  });
+  const stdout = capturedStream(child.stdout);
+  const stderr = capturedStream(child.stderr);
+  const completed = Promise.all([child.exited, stdout.text, stderr.text]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  addWakeProcess(child);
+  try {
+    const outcome = await Promise.race([
+      completed.then(value => ({ kind: "completed" as const, value })),
+      new Promise<{ kind: "timeout" }>(resolve => { timer = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs); }),
+    ]);
+    if (outcome.kind === "completed") {
+      const [code, stdoutText, stderrText] = outcome.value;
+      return { code, stdout: stdoutText, stderr: stderrText, timedOut: false };
+    }
+    await stopWakeProcess(child);
+    await Promise.race([Promise.allSettled([stdout.cancel(), stderr.cancel()]), Bun.sleep(1_000)]);
+    return { code: 1, stdout: "", stderr: "", timedOut: true };
+  } catch (error) {
+    await stopWakeProcess(child);
+    await Promise.race([Promise.allSettled([stdout.cancel(), stderr.cancel()]), Bun.sleep(1_000)]);
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+    removeWakeProcess(child);
+  }
+}
+
+export async function wakeOne(account: Account, options: WakeOptions = {}): Promise<WakeResult> {
   await syncCliProxyAuth(account);
   const challenge = randomBytes(32).toString("hex"); const directory = await mkdtemp(join(tmpdir(), "multicodex-wake-")); const output = join(directory, "last-message.txt");
   try {
     const prompt = `Reply with exactly the following challenge string and nothing else. Do not use Markdown and do not call tools:\n${challenge}`;
-    const result = await run([findExecutable("codex"), ...wakeCodexArgs(output, prompt)], { env: { ...Bun.env, CODEX_HOME: account.home }, stdout: "pipe", stderr: "pipe" });
+    const command = options.command ?? [findExecutable("codex")];
+    const timeoutMs = options.timeoutMs ?? WAKE_TIMEOUT_MS;
+    const result = await runWakeRequest([...command, ...wakeCodexArgs(output, prompt)], account, timeoutMs);
+    if (result.timedOut) return { name: account.name, code: 1, detail: `Codex request timed out after ${timeoutMs / 1_000} seconds` };
     if (result.code) return { name: account.name, code: result.code, detail: result.stderr.trim() || "Codex request failed" };
     const response = (await readFile(output, "utf8")).trimEnd(); const matches = response.length === challenge.length && timingSafeEqual(Buffer.from(response), Buffer.from(challenge));
     return { name: account.name, code: matches ? 0 : 1, detail: matches ? "challenge verified" : "Codex response did not match the random challenge" };
@@ -719,15 +890,24 @@ export function wakeCodexArgs(output: string, prompt: string): string[] {
   ];
 }
 
-async function wake(base: string, format: OutputFormat): Promise<number> {
+export async function wake(base: string, format: OutputFormat, options: {
+  wakeAccount?: (account: Account) => Promise<WakeResult>;
+  queryUsage?: (account: Account) => Promise<Json>;
+} = {}): Promise<number> {
   const accounts = (await loadConfig(base)).accounts; if (!accounts.length) throw new MultiCodexError("no accounts configured; use 'add' first");
   if (format === "text") console.log(`Sending requests: ${accounts.length} ${accounts.length === 1 ? "account" : "accounts"}`);
-  const results = await Promise.all(accounts.map(wakeOne));
+  const wakeAccount = options.wakeAccount ?? wakeOne;
+  const results = await Promise.all(accounts.map(async account => {
+    let result: WakeResult;
+    try { result = await wakeAccount(account); }
+    catch (error) { result = { name: account.name, code: 1, detail: error instanceof Error ? error.message : String(error) }; }
+    if (format === "text") console.log(result.code ? `${result.name}: Failed: ${result.detail} (exit code ${result.code})` : `${result.name}: Sent and verified`);
+    return result;
+  }));
   if (format === "text") {
-    for (const result of results) console.log(result.code ? `${result.name}: Failed: ${result.detail} (exit code ${result.code})` : `${result.name}: Sent and verified`);
     console.log(`Wake complete: ${results.filter(result => !result.code).length} of ${results.length}.\n\nUsage resets`);
   }
-  const usages = await Promise.allSettled(accounts.map(queryAccount));
+  const usages = await Promise.allSettled(accounts.map(options.queryUsage ?? queryAccount));
   if (format === "json") {
     console.log(JSON.stringify({
       requests: { successful: results.filter(result => !result.code).length, total: results.length, accounts: results },
