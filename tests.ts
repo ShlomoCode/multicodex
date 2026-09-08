@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { AppServerRequestError, authEmail, automaticName, autoWakeDecision, autoWakeDecisions, billingOutcome, buildUsageReport, defaultBase, formatDate, hasUsableSession, loadConfig, main, parse, parseUsage, readAuthenticatedSession, replaceAuthWithLogin, saveConfig, stableAutoWakeExecutable, subscriptionSummary, timeUntil, validateEmail, validateName, wakeCodexArgs } from "./cli";
+import { platform, tmpdir } from "node:os";
+import { AppServerRequestError, authEmail, automaticName, autoWakeDecision, autoWakeDecisions, billingOutcome, buildUsageReport, defaultBase, formatDate, hasUsableSession, loadConfig, main, parse, parseUsage, readAuthenticatedSession, replaceAuthWithLogin, saveConfig, stableAutoWakeExecutable, subscriptionSummary, timeUntil, validateEmail, validateName, wake, wakeCodexArgs, wakeOne, wakeProcessCommand } from "./cli";
 
 const temporaryDirectories: string[] = [];
 
@@ -34,6 +34,14 @@ async function capture(action: () => Promise<number>): Promise<{ code: number; o
   try { return { code: await action(), output: lines.join("\n") }; }
   finally { console.log = original; }
 }
+
+const successfulUsage = (name: string) => ({
+  name,
+  email: `${name}@example.com`,
+  capacity: 1,
+  tier: "plus",
+  limits: { weekly: { remaining_percent: 100, resets_at: 2_000_000_000 }, five_hour: null },
+});
 
 describe("identity validation", () => {
   test("given_an_escaped_email_when_validated_then_it_is_normalized", () => {
@@ -509,6 +517,187 @@ describe("automatic wake scheduling", () => {
   test("given_a_wake_request_when_arguments_are_built_then_terra_low_is_forced", () => {
     const args = wakeCodexArgs("/tmp/result", "challenge");
     expect(args.slice(1, 5)).toEqual(["--model", "gpt-5.6-terra", "--config", 'model_reasoning_effort="low"']);
+  });
+
+  test("given_a_wake_process_whose_descendant_holds_the_pipes_when_it_finishes_or_times_out_then_the_process_tree_is_stopped", async () => {
+    const root = await temporaryDirectory();
+    const home = join(root, "home");
+    const executable = join(root, "fake-codex.ts");
+    const descendant = join(root, "descendant.ts");
+    await mkdir(home);
+    await writeFile(descendant, [
+      `await Bun.write(${JSON.stringify(join(home, "descendant.pid"))}, String(process.pid));`,
+      "await Bun.sleep(10_000);",
+    ].join("\n"));
+    await writeFile(executable, [
+      `Bun.spawn([process.execPath, ${JSON.stringify(descendant)}], { stdin: "ignore", stdout: "inherit", stderr: "inherit" });`,
+      `const pidFile = ${JSON.stringify(join(home, "descendant.pid"))};`,
+      "while (!(await Bun.file(pidFile).exists())) await Bun.sleep(5);",
+      'const outputIndex = process.argv.indexOf("--output-last-message");',
+      'const challenge = process.argv.at(-1)!.split("\\n").at(-1)!;',
+      "await Bun.write(process.argv[outputIndex + 1], challenge);",
+      "process.exit(0);",
+    ].join("\n"));
+
+    const started = Date.now();
+    const result = await wakeOne({ name: "stalled", home }, { command: [process.execPath, executable], timeoutMs: 1_000 });
+
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(result).toEqual(platform() === "win32"
+      ? { name: "stalled", code: 0, detail: "challenge verified" }
+      : { name: "stalled", code: 1, detail: "Codex request timed out after 1 seconds" });
+    const descendantPid = Number(await readFile(join(home, "descendant.pid"), "utf8"));
+    let alive = true;
+    for (let attempt = 0; attempt < 20 && alive; attempt++) {
+      try { process.kill(descendantPid, 0); await Bun.sleep(25); }
+      catch { alive = false; }
+    }
+    try { expect(alive).toBeFalse(); }
+    finally { if (alive) try { process.kill(descendantPid, "SIGKILL"); } catch {} }
+  });
+
+  test("given_a_windows_wake_runner_when_its_command_finishes_then_arguments_output_and_exit_status_are_preserved", async () => {
+    const root = await temporaryDirectory();
+    const script = join(root, "command with spaces.ts");
+    await writeFile(script, 'console.log(process.argv.at(-1)); console.error("synthetic stderr"); process.exit(7);');
+    const child = Bun.spawn(wakeProcessCommand([process.execPath, script, "argument with spaces"], "win32"), { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code).toBe(7);
+    expect(stdout.trim()).toBe("argument with spaces");
+    expect(stderr.trim()).toBe("synthetic stderr");
+  });
+
+  test("given_a_running_wake_process_when_the_deadline_passes_then_it_is_bounded", async () => {
+    const root = await temporaryDirectory();
+    const executable = join(root, "fake-codex.ts");
+    await writeFile(executable, "await Bun.sleep(10_000);\n");
+
+    const started = Date.now();
+    const result = await wakeOne({ name: "running", home: root }, { command: [process.execPath, executable], timeoutMs: 100 });
+
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(result.detail).toBe("Codex request timed out after 0.1 seconds");
+  });
+
+  test.skipIf(platform() === "win32")("given_a_wake_process_ignoring_termination_when_the_cli_is_cancelled_then_the_owned_process_group_is_killed", async () => {
+    const root = await temporaryDirectory();
+    const pidFile = join(root, "wake.pid");
+    const executable = join(root, "fake-codex.ts");
+    const worker = join(root, "worker.ts");
+    await writeFile(executable, [
+      'process.on("SIGINT", () => {});',
+      'process.on("SIGTERM", () => {});',
+      `await Bun.write(${JSON.stringify(pidFile)}, String(process.pid));`,
+      "await Bun.sleep(10_000);",
+    ].join("\n"));
+    await writeFile(worker, [
+      `import { wakeOne } from ${JSON.stringify(new URL("./cli.ts", import.meta.url).href)};`,
+      `await wakeOne({ name: "cancelled", home: ${JSON.stringify(root)} }, { command: [process.execPath, ${JSON.stringify(executable)}], timeoutMs: 10_000 });`,
+    ].join("\n"));
+    const parent = Bun.spawn([process.execPath, worker], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    for (let attempt = 0; attempt < 100 && !(await Bun.file(pidFile).exists()); attempt++) await Bun.sleep(10);
+    const wakePid = Number(await readFile(pidFile, "utf8"));
+
+    parent.kill("SIGTERM");
+    await Promise.race([parent.exited, Bun.sleep(1_000)]);
+    let alive = true;
+    for (let attempt = 0; attempt < 20 && alive; attempt++) {
+      try { process.kill(wakePid, 0); await Bun.sleep(25); }
+      catch { alive = false; }
+    }
+    try { expect(alive).toBeFalse(); }
+    finally { if (alive) try { process.kill(wakePid, "SIGKILL"); } catch {} }
+  });
+
+  test("given_a_real_wake_process_when_it_writes_the_challenge_then_the_response_is_verified", async () => {
+    const root = await temporaryDirectory();
+    const executable = join(root, "fake-codex.ts");
+    await writeFile(executable, [
+      'import { writeFile } from "node:fs/promises";',
+      'const outputIndex = process.argv.indexOf("--output-last-message");',
+      'const challenge = process.argv.at(-1)!.split("\\n").at(-1)!;',
+      'await writeFile(process.argv[outputIndex + 1], challenge);',
+    ].join("\n"));
+
+    expect(await wakeOne({ name: "working", home: root }, { command: [process.execPath, executable], timeoutMs: 1_000 }))
+      .toEqual({ name: "working", code: 0, detail: "challenge verified" });
+  });
+
+  test("given_a_real_wake_process_when_it_exits_with_an_error_then_stderr_is_reported", async () => {
+    const root = await temporaryDirectory();
+    const executable = join(root, "fake-codex.ts");
+    await writeFile(executable, 'console.error("synthetic failure"); process.exit(7);\n');
+
+    expect(await wakeOne({ name: "failing", home: root }, { command: [process.execPath, executable], timeoutMs: 1_000 }))
+      .toEqual({ name: "failing", code: 7, detail: "synthetic failure" });
+  });
+
+  test("given_independent_wake_results_when_text_output_is_requested_then_each_account_is_reported_as_it_settles", async () => {
+    const root = await temporaryDirectory();
+    await saveConfig(root, { version: 1, accounts: [
+      { name: "slow", home: join(root, "slow") },
+      { name: "broken", home: join(root, "broken") },
+    ] });
+
+    let releaseSlow!: () => void;
+    const slow = new Promise<void>(resolve => { releaseSlow = resolve; });
+    const lines: string[] = [];
+    let reportBroken!: () => void;
+    const brokenReported = new Promise<void>(resolve => { reportBroken = resolve; });
+    const original = console.log;
+    console.log = (...values: unknown[]) => {
+      const line = values.join(" ");
+      lines.push(line);
+      if (line.includes("broken: Failed: spawn failed")) reportBroken();
+    };
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const running = wake(root, "text", {
+        wakeAccount: async account => {
+          if (account.name === "broken") throw new Error("spawn failed");
+          await slow;
+          return { name: account.name, code: 0, detail: "challenge verified" };
+        },
+        queryUsage: async account => successfulUsage(account.name),
+      });
+      await Promise.race([
+        brokenReported,
+        new Promise<void>((_, reject) => { deadline = setTimeout(() => reject(new Error("completed account was not reported while its peer was pending")), 1_000); }),
+      ]);
+      expect(lines.join("\n")).toContain("broken: Failed: spawn failed");
+      expect(lines.join("\n")).not.toContain("slow: Sent and verified");
+      releaseSlow();
+      expect(await running).toBe(1);
+      expect(lines.join("\n")).toContain("slow: Sent and verified");
+      expect(lines.join("\n")).toContain("Wake complete: 1 of 2.");
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      releaseSlow();
+      console.log = original;
+    }
+  });
+
+  test("given_a_thrown_wake_failure_when_json_output_is_requested_then_one_valid_report_contains_every_account", async () => {
+    const root = await temporaryDirectory();
+    await saveConfig(root, { version: 1, accounts: [
+      { name: "ok", home: join(root, "ok") },
+      { name: "broken", home: join(root, "broken") },
+    ] });
+
+    const result = await capture(() => wake(root, "json", {
+      wakeAccount: async account => {
+        if (account.name === "broken") throw new Error("cannot spawn Codex");
+        return { name: account.name, code: 0, detail: "challenge verified" };
+      },
+      queryUsage: async account => successfulUsage(account.name),
+    }));
+    const report = JSON.parse(result.output);
+
+    expect(result.code).toBe(1);
+    expect(report.requests).toEqual({ successful: 1, total: 2, accounts: [
+      { name: "ok", code: 0, detail: "challenge verified" },
+      { name: "broken", code: 1, detail: "cannot spawn Codex" },
+    ] });
   });
 
   test("given_a_homebrew_cellar_executable_when_the_scheduler_is_built_then_the_stable_link_is_used", () => {

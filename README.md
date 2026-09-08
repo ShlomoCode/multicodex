@@ -50,3 +50,9 @@ Examples:
 
 Wake requests use the official Codex CLI in ephemeral, read-only mode and
 verify a random cryptographic challenge. Multicodex has no backend.
+
+`wake` reports each account's result as soon as its request finishes. Each
+request has a 60-second timeout, including requests sent by `autowake`.
+A failed or timed-out request does not stop the other accounts. JSON output
+remains a single report after all accounts finish.
+On Windows, wake requests require Bun 1.4 or later for process-tree cleanup.
