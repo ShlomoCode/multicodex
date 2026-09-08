@@ -7,6 +7,11 @@ import { basename, dirname, join, resolve } from "node:path";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 
 export class MultiCodexError extends Error {}
+export class AppServerRequestError extends MultiCodexError {
+  constructor(readonly method: string, readonly rpcError: Json) {
+    super(`${method} failed: ${JSON.stringify(rpcError)}`);
+  }
+}
 
 type Account = { name: string; home: string; expected_email?: string };
 type Config = { version: 1; accounts: Account[]; active_account?: string };
@@ -227,6 +232,24 @@ export async function authEmail(home: string): Promise<string | null> {
   return null;
 }
 
+function accountIdFromAuth(auth: Json): string | null {
+  const tokenPayloads = ["id_token", "access_token", "idToken", "accessToken"]
+    .map(key => decodeJwt(auth.tokens?.[key]))
+    .filter(Boolean) as Json[];
+  for (const container of [auth, auth.tokens, ...tokenPayloads].filter(Boolean)) {
+    for (const candidate of [container, container["https://api.openai.com/auth"]].filter(Boolean)) {
+      for (const key of ["chatgpt_account_id", "account_id"]) {
+        if (typeof candidate[key] === "string" && candidate[key]) return candidate[key];
+      }
+    }
+  }
+  return null;
+}
+
+async function authAccountId(home: string): Promise<string | null> {
+  return accountIdFromAuth(await readAuth(home));
+}
+
 async function verifyIdentity(account: Account, home = account.home): Promise<string | null> {
   const actual = await authEmail(home);
   if (account.expected_email && actual?.toLowerCase() !== account.expected_email.toLowerCase()) {
@@ -235,11 +258,26 @@ async function verifyIdentity(account: Account, home = account.home): Promise<st
   return actual;
 }
 
+type AppServerClient = { request(method: string, params: unknown): Promise<Json> };
+
+function isRateLimitAuthenticationFailure(error: unknown): boolean {
+  if (!(error instanceof AppServerRequestError) || error.method !== "account/rateLimits/read") return false;
+  const { code, message } = error.rpcError;
+  return code === -32603 && typeof message === "string" && /(?:^|\s)401 Unauthorized(?:;|\s|$)/.test(message);
+}
+
+export async function readAuthenticatedSession(client: AppServerClient): Promise<Json> {
+  const identity = await client.request("account/read", { refreshToken: false });
+  try { await client.request("account/rateLimits/read", null); }
+  catch (error) { if (isRateLimitAuthenticationFailure(error)) throw error; }
+  return identity;
+}
+
 export async function hasUsableSession(account: Account, readAccount = async (home: string): Promise<Json> => {
   const client = new AppServer(home);
   try {
     await client.initialize();
-    return await client.request("account/read", { refreshToken: false });
+    return await readAuthenticatedSession(client);
   } finally { await client.close(); }
 }): Promise<boolean> {
   let result: Json;
@@ -248,7 +286,7 @@ export async function hasUsableSession(account: Account, readAccount = async (ho
   const actual = result.account?.email;
   if (!actual) return false;
   if (account.expected_email && actual.toLowerCase() !== account.expected_email.toLowerCase()) {
-    throw new MultiCodexError(`logged in as ${JSON.stringify(actual)}, expected ${JSON.stringify(account.expected_email)}`);
+    return false;
   }
   return true;
 }
@@ -327,7 +365,7 @@ class AppServer {
       let message: Json;
       try { message = JSON.parse(await this.line()); } catch { continue; }
       if (message.id !== id) continue;
-      if (message.error) throw new MultiCodexError(`${method} failed: ${JSON.stringify(message.error)}`);
+      if (message.error) throw new AppServerRequestError(method, message.error);
       return message.result;
     }
   }
@@ -474,12 +512,23 @@ export const timeUntil = (seconds: unknown, now = Date.now() / 1000) => {
 
 async function login(account: Account): Promise<number> {
   console.log(`Sign in: ${account.name} (${account.expected_email})`);
-  await mkdir(account.home, { recursive: true });
   console.log("Choose how to sign in:\n  1. Browser (recommended)\n  2. Device code (must be enabled in ChatGPT settings)");
   const choice = prompt("Choice [1]: ")?.trim() ?? "";
   if (!["", "1", "2"].includes(choice)) throw new MultiCodexError("enter 1 or 2");
   const command = [findExecutable("codex"), "login", ...(choice === "2" ? ["--device-auth"] : [])];
-  return (await run(command, { env: { ...Bun.env, CODEX_HOME: account.home } })).code;
+  return replaceAuthWithLogin(account, async loginHome => (await run(command, { env: { ...Bun.env, CODEX_HOME: loginHome } })).code);
+}
+
+export async function replaceAuthWithLogin(account: Account, execute: (loginHome: string) => Promise<number>): Promise<number> {
+  await mkdir(dirname(account.home), { recursive: true });
+  const loginHome = await mkdtemp(join(dirname(account.home), `.${basename(account.home)}-login-`));
+  try {
+    const code = await execute(loginHome);
+    if (code !== 0) return code;
+    await verifyIdentity(account, loginHome);
+    await copyAuth(loginHome, account.home);
+    return 0;
+  } finally { await rm(loginHome, { recursive: true, force: true }); }
 }
 
 async function add(base: string, args: string[]): Promise<number> {
@@ -535,7 +584,21 @@ async function removeAccount(base: string, args: string[]): Promise<number> {
 async function useAccount(base: string, args: string[]): Promise<number> {
   const config = await loadConfig(base); const account = findAccount(config, args[0] ?? ""); const main = defaultMainHome();
   console.log(`Switching account: ${account.name}`); await verifyIdentity(account);
-  if (config.active_account && config.active_account !== account.name) { const current = findAccount(config, config.active_account); if (exists(authPath(main))) await copyAuth(main, current.home); }
+  if (config.active_account && config.active_account !== account.name) {
+    const current = findAccount(config, config.active_account);
+    if (exists(authPath(main))) {
+      const actual = await authEmail(main);
+      const savedAuthExists = exists(authPath(current.home));
+      const expected = current.expected_email ?? (savedAuthExists ? await authEmail(current.home) : null);
+      const savedAccountId = savedAuthExists ? await authAccountId(current.home) : null;
+      if (!expected && !savedAccountId) throw new MultiCodexError(`cannot switch accounts safely: saved active account ${JSON.stringify(current.name)} has no email or account ID`);
+      const actualAccountId = await authAccountId(main);
+      const emailMatches = !expected || (actual && actual.toLowerCase() === expected.toLowerCase());
+      const accountIdMatches = !savedAccountId || actualAccountId === savedAccountId;
+      if (emailMatches && accountIdMatches) await copyAuth(main, current.home);
+      else console.error(`multicodex: main Codex identity does not match active account ${JSON.stringify(current.name)}; preserving its saved profile`);
+    }
+  }
   await copyAuth(account.home, main); config.active_account = account.name; await saveConfig(base, config);
   console.log(`Active account: ${account.name}${account.expected_email ? ` (${account.expected_email})` : ""}\nRestart any open Codex app or terminal to use this account.`); return 0;
 }
